@@ -56,9 +56,87 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.stop_btn)
         layout.addLayout(btn_layout)
 
+
         self.ssm_btn = QPushButton("Run SSM Command on Selected")
         self.ssm_btn.clicked.connect(self.run_ssm_command)
         layout.addWidget(self.ssm_btn)
+
+        self.ssm_doc_btn = QPushButton("Run SSM Document (ERApp)")
+        self.ssm_doc_btn.clicked.connect(self.run_ssm_document_erapp)
+        layout.addWidget(self.ssm_doc_btn)
+    def run_ssm_document_erapp(self):
+        if not self.ec2:
+            QMessageBox.warning(self, "Not Ready", "Set AWS profile and region first.")
+            return
+        if not self.ensure_sso_login(self.profile):
+            return
+        try:
+            ssm = self.session.client('ssm')
+            # Get SSM documents with tag ERApp=true
+            paginator = ssm.get_paginator('list_documents')
+            docs = []
+            for page in paginator.paginate(Filters=[{"Key": "Owner", "Values": ["Self"]}]):
+                for doc in page.get('DocumentIdentifiers', []):
+                    doc_name = doc['Name']
+                    tags = ssm.list_tags_for_resource(ResourceType='Document', ResourceId=doc_name).get('TagList', [])
+                    if any(t['Key'] == 'ERApp' and t['Value'] == 'true' for t in tags):
+                        docs.append(doc)
+            if not docs:
+                QMessageBox.information(self, "No SSM Documents", "No SSM documents found with tag ERApp=true.")
+                return
+            doc_names = [f"{doc['Name']} ({doc['DocumentType']})" for doc in docs]
+            doc_map = {f"{doc['Name']} ({doc['DocumentType']})": doc['Name'] for doc in docs}
+            doc_choice, ok = self.select_from_list("Select SSM Document", "Choose SSM Document to run:", doc_names)
+            if not ok or not doc_choice:
+                return
+            doc_name = doc_map[doc_choice]
+            # Select instance to run on
+            instances = list(self.ec2.instances.all())
+            if not instances:
+                QMessageBox.warning(self, "No Instances", "No EC2 instances found.")
+                return
+            inst_names = [f"{inst.id} | {next((t['Value'] for t in inst.tags or [] if t['Key'] == 'Name'), '-') }" for inst in instances]
+            inst_map = {f"{inst.id} | {next((t['Value'] for t in inst.tags or [] if t['Key'] == 'Name'), '-') }": inst.id for inst in instances}
+            inst_choice, ok = self.select_from_list("Select Instance", "Choose instance to run document:", inst_names)
+            if not ok or not inst_choice:
+                return
+            instance_id = inst_map[inst_choice]
+            # Prompt for parameters if needed
+            doc_desc = ssm.describe_document(Name=doc_name)
+            params = doc_desc.get('Document', {}).get('Parameters', [])
+            param_values = {}
+            for param in params:
+                key = param['Name']
+                default = param.get('DefaultValue', "")
+                desc = param.get('Description', "")
+                value, ok = QInputDialog.getText(self, f"Parameter: {key}", f"{desc}\nDefault: {default}")
+                if not ok:
+                    return
+                param_values[key] = [value if value else default]
+            # Run the document
+            try:
+                response = ssm.send_command(
+                    InstanceIds=[instance_id],
+                    DocumentName=doc_name,
+                    Parameters=param_values if param_values else {},
+                )
+                command_id = response['Command']['CommandId']
+                import time
+                for _ in range(30):
+                    time.sleep(2)
+                    output = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+                    if output['Status'] in ('Success', 'Failed', 'Cancelled', 'TimedOut'):
+                        break
+                out = output.get('StandardOutputContent', '').strip()
+                err = output.get('StandardErrorContent', '').strip()
+                msg = f"Output:\n{out}"
+                if err:
+                    msg += f"\n\nError:\n{err}"
+                QMessageBox.information(self, "SSM Output", msg)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error running SSM document: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error fetching SSM documents: {e}")
 
         widget.setLayout(layout)
         self.setCentralWidget(widget)

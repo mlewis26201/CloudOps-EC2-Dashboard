@@ -96,9 +96,76 @@ def dashboard(profile, region):
             "View/Edit instance tags",
             "Instance Lookup",
             "Run Shell Command (SSM)",
+            "Run SSM Document (ERApp)",
             "Switch Profile",
             "Exit"
         ]
+        if choice == "Run SSM Document (ERApp)":
+            instances = get_instances(profile, region)
+            if not instances:
+                console.print("[red]No instances found.[/red]")
+                continue
+            session = boto3.Session(profile_name=profile, region_name=region)
+            ssm = session.client('ssm')
+            # Get SSM documents with tag ERApp=true
+            try:
+                paginator = ssm.get_paginator('list_documents')
+                docs = []
+                for page in paginator.paginate(Filters=[{"Key": "Owner", "Values": ["Self"]}]):
+                    for doc in page.get('DocumentIdentifiers', []):
+                        doc_name = doc['Name']
+                        # Get tags for this document
+                        tags = ssm.list_tags_for_resource(ResourceType='Document', ResourceId=doc_name).get('TagList', [])
+                        if any(t['Key'] == 'ERApp' and t['Value'] == 'true' for t in tags):
+                            docs.append(doc)
+                if not docs:
+                    console.print("[yellow]No SSM documents found with tag ERApp=true.[/yellow]")
+                    continue
+                doc_choices = [questionary.Choice(title=f"{doc['Name']} ({doc['DocumentType']})", value=doc['Name']) for doc in docs]
+                doc_name = questionary.select("Select SSM Document to run:", choices=doc_choices).ask()
+                if not doc_name:
+                    continue
+                # Select instance(s) to run on
+                instance_choices = []
+                for inst in instances:
+                    name = next((t['Value'] for t in inst.tags or [] if t['Key'] == 'Name'), "-")
+                    label = f"{inst.id} | {name}"
+                    instance_choices.append(questionary.Choice(title=label, value=inst.id))
+                instance_id = questionary.select("Select an instance to run the document:", choices=instance_choices).ask()
+                if not instance_id:
+                    continue
+                # Prompt for parameters if needed
+                doc_desc = ssm.describe_document(Name=doc_name)
+                params = doc_desc.get('Document', {}).get('Parameters', [])
+                param_values = {}
+                for param in params:
+                    key = param['Name']
+                    default = param.get('DefaultValue', "")
+                    desc = param.get('Description', "")
+                    prompt = f"Enter value for {key} ({desc})"
+                    value = Prompt.ask(prompt, default=default)
+                    param_values[key] = [value]
+                # Run the document
+                try:
+                    response = ssm.send_command(
+                        InstanceIds=[instance_id],
+                        DocumentName=doc_name,
+                        Parameters=param_values if param_values else {},
+                    )
+                    command_id = response['Command']['CommandId']
+                    import time
+                    for _ in range(30):
+                        time.sleep(2)
+                        output = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+                        if output['Status'] in ('Success', 'Failed', 'Cancelled', 'TimedOut'):
+                            break
+                    console.print(Panel(f"[bold]Command Output:[/bold]\n{output.get('StandardOutputContent', '').strip()}", title="SSM Output"))
+                    if output.get('StandardErrorContent'):
+                        console.print(Panel(f"[red]{output['StandardErrorContent']}[/red]", title="SSM Error"))
+                except Exception as e:
+                    console.print(f"[red]Error running SSM document: {e}[/red]")
+            except Exception as e:
+                console.print(f"[red]Error fetching SSM documents: {e}[/red]")
         choice = questionary.select("Select an option:", choices=menu).ask()
 
         if choice == "List EC2 instances":
